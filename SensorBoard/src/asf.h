@@ -74,9 +74,6 @@
 // From module: SERCOM Polled API
 #include <sercom.h>
 
-// From module: SERCOM SPI - Serial Peripheral Interface (Polled APIs)
-#include <spi.h>
-
 // From module: SERCOM USART - Serial Communications (Polled APIs)
 #include <usart.h>
 
@@ -98,11 +95,5 @@
 
 // From module: SYSTEM - Reset Management for SAM D20/D21/R21/D09/D10/D11/DA/HA
 #include <reset.h>
-
-// From module: TC - Timer Counter (Polled APIs)
-#include <tc.h>
-
-// From module: TCC - Timer Counter for Control Applications (Polled APIs)
-#include <tcc.h>
 
 #endif // ASF_H

@@ -1,9 +1,8 @@
 /*
-* protocol.c
-*
-* Created: 25.01.2022 18:08:44
-*  Author: Radtke
-*/
+ * Copyright © Jonas Radtke
+ *
+ * License GPL-3.0-or-later
+ */
 
 #include "modbusSlave.h"
 
@@ -15,189 +14,393 @@
 #define WRITE_SINGLE_REGISTER		0x06
 #define WRITE_MULTIPLE_COILS		0x0F
 #define WRITE_MULTIPLE_REGISTERS	0x10
-#define FRAMEERROR					0xFFFF
-#define WRONGSLAVEID				0xFFFE
+#define ERROR					    0xFFFF
+
+#define ILLEGAL_FUNCTION			0x01
+#define ILLEGAL_DATA_ADDRESS		0x02
+#define ILLEGAL_DATA_VALUE			0x03
 
 
-void procotolRoutine(comm *communication)
+
+void modbusSlaveCyclic(mbComm *com, mbDataMapping *data)
 {
-volatile	uint16_t functionCode = 0;
+	uint32_t i;
+    uint16_t functionCode = 0;
+	uint8_t memoryadress = 0;
+	uint8_t memorylength = 0;
 	uint16_t crc;
 	uint16_t crcMessage;
-	uint8_t exepctionCode = 0;
+	uint16_t actualBit;
+	uint8_t shift;
+
 	// Prüfen ob letztes Zeichen empfangen wurde. Empfang Aktiv + Abgelaufener Timer
-	if (communication->rxActive && (checkTimer()))
+	if (com->rxActive && (MBcheckTimer()))
 	{
-		communication->rxActive = 0;
-		communication->rxDone = 1;
+		com->rxActive = 0;
+		com->rxDone = 1;
 		
 		// CRC Prüfen, letzte beiden Bytes im Frame
-		crc = crc16(&communication->rxBuffer[0], communication->rxLength-2);
-		crcMessage = (communication->rxBuffer[communication->rxLength - 1] << 8) | (communication->rxBuffer[communication->rxLength - 2] & 0xFF);
+		crc = crc16(&com->rxBuffer[0], com->rxLength-2);
+		crcMessage = (com->rxBuffer[com->rxLength - 1] << 8) | (com->rxBuffer[com->rxLength - 2] & 0xFF);
 		
 		if (crc != crcMessage)
 		{
-			functionCode = FRAMEERROR; // CRC Falsch oder Daten kaputt -> keine Antwort
+			functionCode = ERROR; // CRC Falsch oder Daten kaputt -> keine Antwort
 		}
-		else if (communication->rxBuffer[0] == SLAVEID) // Functions Code, Speicheradresse und Speicherlänge exthrahieren
+		else if (com->rxBuffer[0] == SLAVEID) // Functions Code, Speicheradresse und Speicherlänge exthrahieren
 		{
-			functionCode = (uint16_t)communication->rxBuffer[1];
+			functionCode = (uint16_t)com->rxBuffer[1];
 		}
 		else{
-			functionCode = WRONGSLAVEID;
+			functionCode = ERROR; // Falsche SlaveID -> keine Antwort
 		}
-
-		communication->rxDone = 1;
+		com->rxDone = 1;
 	}
 	
-	uint32_t i;
-	switch (functionCode)
+	if (functionCode)
 	{
-		case READ_COILS:
-			communication->memoryadress = (communication->rxBuffer[2] << 8) | (communication->rxBuffer[3] & 0xFF);
-			communication->memorylength = (communication->rxBuffer[4] << 8) | (communication->rxBuffer[5] & 0xFF);
-		if ((communication->memorylength <= 0x0001) || (communication->memorylength >= 0x07D0))
+		switch (functionCode)
 		{
-			// zu lang
-			exepctionCode = 0x03;
-		}
-		else if ((communication->memoryadress > MAXCOILS) || ((communication->memoryadress + communication->memorylength) > MAXCOILS ))
-		{
-			// Adressbereich ungültig zu lang Exception 02
-			exepctionCode = 0x02;
-		}
-		else
-		{
-			communication->txBuffer[0] = SLAVEID;
-			communication->txBuffer[1] = READ_COILS;
-			communication->txBuffer[2] = 0;
+			#if MAX_COILS > 0
+			case READ_COILS: // Code 1 Read Coils
+				memoryadress = (com->rxBuffer[2] << 8) | (com->rxBuffer[3] & 0xFF);
+				memorylength = (com->rxBuffer[4] << 8) | (com->rxBuffer[5] & 0xFF);
+				shift = memoryadress % 8;
 			
-			
-			
-		}
-		
-		break;
-		
-		case READ_DISCRETE_INPUTS:
-		break;
+				// 0x0001 <= Quantity of Outputs <= 0x07B0
+				if (!((memorylength >= 0x0001) && (memorylength <= 0x07D0))) exceptionCode(com, READ_COILS, ILLEGAL_DATA_VALUE);
+				// Starting Address == OK
+				else if (memoryadress >= (COILS_START_ADRESS + MAX_COILS)) exceptionCode(com, READ_COILS, ILLEGAL_DATA_ADDRESS);
+				// Starting Address + Quantity of Outputs == OK
+				else if (memoryadress + memorylength > (COILS_START_ADRESS + MAX_COILS)) exceptionCode(com, READ_COILS, ILLEGAL_DATA_ADDRESS);
+				else
+				{
+					com->txBuffer[0] = SLAVEID;
+					com->txBuffer[1] = READ_COILS;
+					if (memorylength%8) com->txBuffer[2] = (memorylength/8)+1;
+					else com->txBuffer[2] = memorylength/8;
 
-		case READ_HOLD_REGISTERS: // Output Registers
-			communication->memoryadress = (communication->rxBuffer[2] << 8) | (communication->rxBuffer[3] & 0xFF);
-			communication->memorylength = (communication->rxBuffer[4] << 8) | (communication->rxBuffer[5] & 0xFF);
-			
-			if ((communication->memorylength <= 0x0001) || (communication->memorylength >= 0x07D0))
-			{
-				// zu lang
-				exepctionCode = 0x03;
-			}
-			else if ((communication->memoryadress > MAXOUTPUTREGISTERS) || ((communication->memoryadress + communication->memorylength) > MAXOUTPUTREGISTERS ))
-			{
-				// Adressbereich ungültig zu lang Exception 02
-				exepctionCode = 0x02;
-			}
-			else
-			{
-				communication->txBuffer[0] = SLAVEID;
-				communication->txBuffer[1] = READ_HOLD_REGISTERS;
-				communication->txBuffer[2] = communication->memorylength * 2;
+					actualBit = 0;
+					clearTxBuffer(com);
+					// Read Coils and create response
+					for (i=0; i < memorylength; i++)
+					{
+						if ((data->coils[(shift + actualBit)/8] >> (shift + actualBit)%8) & 0x01)
+						{
+							com->txBuffer[3 + actualBit/8] = (0x01 << actualBit%8) | (com->txBuffer[3 + actualBit/8] & (~(0x01 << actualBit%8)));
+						}
+						else
+						{
+							com->txBuffer[3 + actualBit/8] = (com->txBuffer[3 + actualBit/8] & (~(0x01 << actualBit%8)));
+						}
+						actualBit++;
+					}
 				
-				for (i=0; i < communication->memorylength ; i++)
-				{
-					communication->txBuffer[(i*2)+3] = (uint8_t)((communication->outputregisters[i+communication->memoryadress] >> 8) & 0x00FF);
-					communication->txBuffer[(i*2+1)+3] = (uint8_t)((communication->outputregisters[i+communication->memoryadress]) & 0x00FF);
+					com->txLength = 3 + com->txBuffer[2]  + 2;				
+					sendSlaveResponse(com);
 				}
-				communication->txLength = 3 + communication->memorylength*2 + 2;
-				crc = crc16(&communication->txBuffer[0], communication->txLength - 2);
-				
-				communication->txBuffer[communication->txLength-1] = (uint8_t)((crc >> 8) & 0x00FF);
-				communication->txBuffer[communication->txLength-2] = (uint8_t)((crc) & 0x00FF);
-				
-				sendArraySercom1(communication );
-			}
-		break;
+			break;
+			#endif
 		
-		case READ_INPUT_REGISTERS:
-		// Read Input Registers
-			communication->memoryadress = (communication->rxBuffer[2] << 8) | (communication->rxBuffer[3] & 0xFF);
-			communication->memorylength = (communication->rxBuffer[4] << 8) | (communication->rxBuffer[5] & 0xFF);
+			#if MAX_DISCRETE_INPUTS > 0
+			case READ_DISCRETE_INPUTS:
+				memoryadress = (com->rxBuffer[2] << 8) | (com->rxBuffer[3] & 0xFF);
+				memorylength = (com->rxBuffer[4] << 8) | (com->rxBuffer[5] & 0xFF);
+				shift = memoryadress % 8;
 			
-			if ((communication->memoryadress > (INPUTREGISTERS_START_ADRESS - 30001) + MAXINPUTREGISTERS) || communication->memoryadress < (INPUTREGISTERS_START_ADRESS - 30001))
-			{
-				// Adresse gibt es nicht Exception 02 Illegal Data
-				exepctionCode = 0x02;
-			}
-			else if ((communication->memoryadress + communication->memorylength) > ((INPUTREGISTERS_START_ADRESS - 30001) + MAXINPUTREGISTERS))
-			{
-				// Adressbereich ungültig zu lang Exception 02
-				exepctionCode = 0x02;
-			}
-			else
-			{
-				communication->txBuffer[0] = SLAVEID;
-				communication->txBuffer[1] = READ_INPUT_REGISTERS;
-				communication->txBuffer[2] = communication->memorylength * 2;
-				
-				for (i=0; i < communication->memorylength ; i++)
+				// 0x0001 <= Quantity of Outputs <= 0x07B0
+				if (!((memorylength >= 0x0001) && (memorylength <= 0x07D0))) exceptionCode(com, READ_DISCRETE_INPUTS, ILLEGAL_DATA_VALUE);
+				// Starting Address == OK
+				else if (memoryadress >= (DISCRETE_INPUT_START_ADRESS + MAX_DISCRETE_INPUTS)) exceptionCode(com, READ_DISCRETE_INPUTS, ILLEGAL_DATA_ADDRESS);
+				// Starting Address + Quantity of Outputs == OK
+				else if (memoryadress + memorylength > (DISCRETE_INPUT_START_ADRESS + MAX_DISCRETE_INPUTS)) exceptionCode(com, READ_DISCRETE_INPUTS, ILLEGAL_DATA_ADDRESS);
+				else
 				{
-					communication->txBuffer[(i*2)+3] = (uint8_t)((communication->inputregisters[i+communication->memoryadress] >> 8) & 0x00FF);
-					communication->txBuffer[(i*2+1)+3] = (uint8_t)((communication->inputregisters[i+communication->memoryadress]) & 0x00FF);
+					com->txBuffer[0] = SLAVEID;
+					com->txBuffer[1] = READ_DISCRETE_INPUTS;
+					if (memorylength%8) com->txBuffer[2] = (memorylength/8)+1;
+					else com->txBuffer[2] = memorylength/8;
+				
+					actualBit = 0;
+					clearTxBuffer(com);
+					// Read Discrete Inputs and create response
+					for (i=0; i < memorylength; i++)
+					{
+						if ((data->discreteInputs[(shift + actualBit)/8] >> (shift + actualBit)%8) & 0x01)
+						{
+							com->txBuffer[3 + actualBit/8] = (0x01 << actualBit%8) | (com->txBuffer[3 + actualBit/8] & (~(0x01 << actualBit%8)));
+						}
+						else
+						{
+							com->txBuffer[3 + actualBit/8] = (com->txBuffer[3 + actualBit/8] & (~(0x01 << actualBit%8)));
+						}
+						actualBit++;
+					}
+					com->txLength = 3 + com->txBuffer[2]  + 2;
+					sendSlaveResponse(com);
 				}
-				communication->txLength = 3 + communication->memorylength*2 + 2;
-				crc = crc16(&communication->txBuffer[0], communication->txLength - 2);
+			break;
+			#endif
+		
+			#if MAX_HOLDING_REGISTERS > 0
+			case READ_HOLD_REGISTERS: //  Read Holding Registers Code 03
+				memoryadress = (com->rxBuffer[2] << 8) | (com->rxBuffer[3] & 0xFF);
+				memorylength = (com->rxBuffer[4] << 8) | (com->rxBuffer[5] & 0xFF);
+			
+				// 0x0001 <= Quantity of Registers <= 0x007D
+				if ((memorylength < 0x0001) || (memorylength > 0x007D)) exceptionCode(com, READ_HOLD_REGISTERS, ILLEGAL_DATA_VALUE);
+				// Starting Address == OK
+				else if (memoryadress >= (HOLDING_REGISTERS_START_ADRESS + MAX_HOLDING_REGISTERS)) exceptionCode(com, READ_HOLD_REGISTERS, ILLEGAL_DATA_ADDRESS);
+				// Starting Address + Quantity of Registers == OK
+				else if ((memoryadress + memorylength) > ((HOLDING_REGISTERS_START_ADRESS + MAX_HOLDING_REGISTERS))) exceptionCode(com, READ_HOLD_REGISTERS, ILLEGAL_DATA_ADDRESS);
+				else
+				{
+					com->txBuffer[0] = SLAVEID;
+					com->txBuffer[1] = READ_HOLD_REGISTERS;
+					com->txBuffer[2] = memorylength * 2;
 				
-				communication->txBuffer[communication->txLength-1] = (uint8_t)((crc >> 8) & 0x00FF);
-				communication->txBuffer[communication->txLength-2] = (uint8_t)((crc) & 0x00FF);
+					// Read Hold Registers and create response
+					for (i=0; i < memorylength ; i++)
+					{
+						com->txBuffer[(i*2)+3] = (uint8_t)((data->holdingRegisters[i+memoryadress] >> 8) & 0x00FF);
+						com->txBuffer[(i*2+1)+3] = (uint8_t)((data->holdingRegisters[i+memoryadress]) & 0x00FF);
+					}
+					com->txLength = 3 + memorylength*2 + 2;
+					sendSlaveResponse(com);
+				}
+			break;
+			#endif
+		
+			#if MAX_INPUT_REGISTERS > 0
+			case READ_INPUT_REGISTERS:
+			// Read Input Registers
+				memoryadress = (com->rxBuffer[2] << 8) | (com->rxBuffer[3] & 0xFF);
+				memorylength = (com->rxBuffer[4] << 8) | (com->rxBuffer[5] & 0xFF);
+			
+				// 0x0001 <= Quantity of Registers <= 0x007D
+				if ((memorylength < 0x0001) || (memorylength > 0x007D)) exceptionCode(com, READ_INPUT_REGISTERS, ILLEGAL_DATA_VALUE);
+				// Starting Address == OK
+				else if (memoryadress >= (INPUT_REGISTERS_START_ADRESS + MAX_INPUT_REGISTERS)) exceptionCode(com, READ_INPUT_REGISTERS, ILLEGAL_DATA_ADDRESS);
+				// Starting Address + Quantity of Registers == OK
+				else if ((memoryadress + memorylength) > ((INPUT_REGISTERS_START_ADRESS + MAX_INPUT_REGISTERS ))) exceptionCode(com, READ_INPUT_REGISTERS, ILLEGAL_DATA_ADDRESS);
+				else
+				{
+					com->txBuffer[0] = SLAVEID;
+					com->txBuffer[1] = READ_INPUT_REGISTERS;
+					com->txBuffer[2] = memorylength * 2;
 				
-				sendArraySercom1(communication );
-			}		
+					// Read Input Registers and create response
+					for (i=0; i < memorylength ; i++)
+					{
+						com->txBuffer[(i*2)+3] = (uint8_t)((data->inputRegisters[i+memoryadress] >> 8) & 0x00FF);
+						com->txBuffer[(i*2+1)+3] = (uint8_t)((data->inputRegisters[i+memoryadress]) & 0x00FF);
+					}
+					com->txLength = 3 + memorylength*2 + 2;
+					sendSlaveResponse(com);
+				}		
+			break;
+			#endif
 		
-		break;
+			#if MAX_COILS > 0
+			case WRITE_SINGLE_COIL: // Code 05 Write Single Coil
+				memoryadress = (com->rxBuffer[2] << 8) | (com->rxBuffer[3] & 0xFF);
+				uint8_t target = memoryadress / 8;
+				shift = memoryadress % 8;
+				uint16_t value = (com->rxBuffer[4] << 8) | (com->rxBuffer[5] & 0xFF);
+			
+				//Output Value == 0x0000 OR 0xFF00
+				if ((value != 0xFF00) && (value != 0x000)) exceptionCode(com, WRITE_SINGLE_COIL, ILLEGAL_DATA_VALUE);
+				// Output Address == OK
+				else if (memoryadress >= (COILS_START_ADRESS + MAX_COILS)) exceptionCode(com, WRITE_SINGLE_COIL, ILLEGAL_DATA_ADDRESS);
+				else
+				{
+					com->txBuffer[0] = SLAVEID;
+					com->txBuffer[1] = WRITE_SINGLE_COIL;
+					com->txBuffer[2] = com->rxBuffer[2];
+					com->txBuffer[3] = com->rxBuffer[3];
+					com->txBuffer[4] = com->rxBuffer[4];
+					com->txBuffer[5] = com->rxBuffer[5];
+				
+					// Write single coil and create response
+					if (value == 0x0000)
+					{
+						data->coils[target] = (data->coils[target] & (~(0x01 << shift)));
+					}
+					else if (value == 0xFF00)
+					{
+						data->coils[target] = (0x01 << shift) | (data->coils[target] & (~(0x01 << shift)));
+					}
+								
+					com->txLength = 6 + 2;
+					sendSlaveResponse(com);				
+				}
+			break;
+			#endif
 		
-		case WRITE_SINGLE_COIL:
-		break;
+			#if MAX_HOLDING_REGISTERS > 0
+			case WRITE_SINGLE_REGISTER: // Code 06 Write Single Register
+				memoryadress = (com->rxBuffer[2] << 8) | (com->rxBuffer[3] & 0xFF);
+
+				// Starting Address == OK
+				if (memoryadress >= HOLDING_REGISTERS_START_ADRESS + MAX_HOLDING_REGISTERS) exceptionCode(com, WRITE_SINGLE_REGISTER, ILLEGAL_DATA_ADDRESS);
+				else
+				{
+					com->txBuffer[0] = SLAVEID;
+					com->txBuffer[1] = WRITE_SINGLE_REGISTER;
+					com->txBuffer[2] = com->rxBuffer[2];
+					com->txBuffer[3] = com->rxBuffer[3];
+					com->txBuffer[4] = com->rxBuffer[4];
+					com->txBuffer[5] = com->rxBuffer[5];
+				
+					// write single register and create response
+					data->holdingRegisters[memoryadress] = ((uint16_t)(com->rxBuffer[4] << 8) & 0xFF00) | ((uint16_t)com->rxBuffer[5] & 0x00FF);
+				
+					com->txLength = 6 + 2;
+					sendSlaveResponse(com);					
+				}
+			break;
+			#endif
 		
-		case WRITE_SINGLE_REGISTER:
-		break;
+			#if MAX_COILS > 0
+			case WRITE_MULTIPLE_COILS: // Code 15 0f Write Multiple Coils
+				memoryadress = (com->rxBuffer[2] << 8) | (com->rxBuffer[3] & 0xFF);
+				memorylength = (com->rxBuffer[4] << 8) | (com->rxBuffer[5] & 0xFF);
+				uint8_t bits = memorylength;
+				uint8_t targetstart = memoryadress / 8;
+				shift = memoryadress % 8;
+				uint16_t bit;
+			
+				//0x0001 <= Quantity of Outputs <= 0x07B0
+				if ((memorylength < 0x0001) || (memorylength > 0x07B0)) exceptionCode(com, WRITE_MULTIPLE_COILS, ILLEGAL_DATA_VALUE);
+				// Starting Address == OK
+				else if (memoryadress >= (COILS_START_ADRESS + MAX_COILS)) exceptionCode(com, WRITE_MULTIPLE_COILS, ILLEGAL_DATA_ADDRESS);
+				// Starting Address + Quantity of Outputs == OK
+				else if (memoryadress + memorylength >= (COILS_START_ADRESS + MAX_COILS)) exceptionCode(com, WRITE_MULTIPLE_COILS, ILLEGAL_DATA_ADDRESS);
+				else
+				{
+					com->txBuffer[0] = SLAVEID;
+					com->txBuffer[1] = WRITE_MULTIPLE_COILS;
+					com->txBuffer[2] = com->rxBuffer[2];
+					com->txBuffer[3] = com->rxBuffer[3];
+					com->txBuffer[4] = com->rxBuffer[4];
+					com->txBuffer[5] = com->rxBuffer[5];
+				
+					bit = 0;
+					// write multiple coils and create response
+					for (i=0; i < bits; i++)
+					{
+						if (com->rxBuffer[7 + (bit/8)] >> bit%8 & 0x01)
+						{
+							data->coils[targetstart + (bit+shift)/8] = (0x01 << (bit+shift)%8) | (data->coils[targetstart + (bit+shift)/8] & (~(0x01 << (bit+shift)%8)));
+						}
+						else
+						{
+							data->coils[targetstart + (bit+shift)/8] = (data->coils[targetstart + (bit+shift)/8] & (~(0x01 << (bit+shift)%8)));
+						}
+					bit++;							
+					}				
+					com->txLength = 6 + 2;
+					sendSlaveResponse(com);
+				}
+			break;
+			#endif
 		
-		case WRITE_MULTIPLE_COILS:
-		break;
+			#if MAX_HOLDING_REGISTERS > 0
+			case WRITE_MULTIPLE_REGISTERS:  //Code 16 - Write Multiple registers
+				memoryadress = (com->rxBuffer[2] << 8) | (com->rxBuffer[3] & 0xFF);
+				memorylength = (com->rxBuffer[4] << 8) | (com->rxBuffer[5] & 0xFF);
+				uint16_t byteCount = com->rxBuffer[6];
+			
+				// 0x0001 <= Quantity of Registers <= 0x007B
+				if ((memorylength < 0x0001) || (memorylength > 0x007B)) exceptionCode(com, WRITE_MULTIPLE_REGISTERS, ILLEGAL_DATA_VALUE);
+				// Byte Count == Quantity of Registers x 2
+				else if (byteCount != memorylength * 2) exceptionCode(com, WRITE_MULTIPLE_REGISTERS, ILLEGAL_DATA_VALUE);
+				// Starting Address == OK
+				else if (memoryadress >= (INPUT_REGISTERS_START_ADRESS + MAX_INPUT_REGISTERS)) exceptionCode(com, WRITE_MULTIPLE_REGISTERS, ILLEGAL_DATA_ADDRESS);
+				// Starting Address + Quantity of Registers == OK
+				else if ((memoryadress + memorylength) > ((INPUT_REGISTERS_START_ADRESS + MAX_INPUT_REGISTERS ))) exceptionCode(com, WRITE_MULTIPLE_REGISTERS, ILLEGAL_DATA_ADDRESS);
+				else
+				{
+					com->txBuffer[0] = SLAVEID;
+					com->txBuffer[1] = WRITE_MULTIPLE_REGISTERS;
+					com->txBuffer[2] = com->rxBuffer[2]; // Starting Adress Hi
+					com->txBuffer[3] = com->rxBuffer[3]; // Starting Adress Lo
+					com->txBuffer[4] = com->rxBuffer[4]; // Quantity of Registers Hi 
+					com->txBuffer[5] = com->rxBuffer[5]; // Quantity of Registers Lo
+				
+					// write multiple register and create response
+					for (i=0; i < memorylength ; i++)
+					{
+						data->holdingRegisters[memoryadress+i] = ((uint16_t)(com->rxBuffer[(i*2)+7] << 8) & 0xFF00) |  ((uint16_t)com->rxBuffer[(i*2+1)+7] & 0x00FF);
+					}			
+					com->txLength = 6 + 2;
+					sendSlaveResponse(com);
+				}		
+			break;
+			#endif	
 		
-		case WRITE_MULTIPLE_REGISTERS:
-		break;	
+			case ERROR:
+			// do nothing
+			break;
 		
-		case FRAMEERROR:
-		case WRONGSLAVEID:
-		// do nothing
-		break;
-		
-		default: // kein richtiger functioncode
-		
-		break;	
+			default: // response illegal function code
+			exceptionCode(com, com->rxBuffer[1], ILLEGAL_FUNCTION);
+			break;	
+		}
 	}
 	
-	if (exepctionCode != 0)
+	if (com->rxDone)
 	{
-		communication->txBuffer[0] = SLAVEID;
-		communication->txBuffer[1] = functionCode | 0x80; // Function Code MSB 1
-		communication->txBuffer[2] = exepctionCode;
-		communication->txLength = 5;
-		crc = crc16(&communication->txBuffer[0], communication->txLength - 2);
-						
-		communication->txBuffer[communication->txLength-1] = (uint8_t)((crc >> 8) & 0x00FF);
-		communication->txBuffer[communication->txLength-2] = (uint8_t)((crc) & 0x00FF);
-		sendArraySercom1(communication );	
-	}
-
-	if (communication->rxDone)
-	{
-		communication->rxActive = 0;
-		communication->rxDone = 0;
-		communication->rxLength = 0;
-
+		com->rxActive = 0;
+		com->rxDone = 0;
+		com->rxLength = 0;
 	}
 }
 
+void exceptionCode(mbComm *com, uint16_t function, uint8_t exception){
+	uint16_t crc;
+	com->txBuffer[0] = SLAVEID;
+	com->txBuffer[1] = function | 0x80; // Function Code MSB 1
+	com->txBuffer[2] = exception;
+	com->txLength = 5;
+	crc = crc16(&com->txBuffer[0], com->txLength - 2);
+		
+	com->txBuffer[com->txLength-1] = (uint8_t)((crc >> 8) & 0x00FF);
+	com->txBuffer[com->txLength-2] = (uint8_t)((crc) & 0x00FF);
+	sendSlaveResponse(com);
+	return;
+}
 
+void clearTxBuffer(mbComm *com){
+	uint32_t i;
+	for (i=3; i<BUFFERLENGTH;i++){
+		com->txBuffer[i] = 0;
+	}
+	return;
+}
+
+void sendSlaveResponse(mbComm *com){
+	uint16_t crc;
+	
+	crc = crc16(&com->txBuffer[0], com->txLength - 2);
+	com->txBuffer[com->txLength-1] = (uint8_t)((crc >> 8) & 0x00FF);
+	com->txBuffer[com->txLength-2] = (uint8_t)((crc) & 0x00FF);
+	
+	MBsendMessage(com->txBuffer, com->txLength);
+	return;
+}
+
+void receiveModbusByte(mbComm *com, uint8_t x){
+	
+	com->rxBuffer[com->rxLength] = x; // Zeichen in Buffer schreiben
+	com->rxLength++;	// Länge um 1 erhöhen
+	if(com->rxLength > BUFFERLENGTH)
+	{
+		com->rxLength = BUFFERLENGTH-1;
+	}
+	com->rxActive = 1;	// Empfang auf Aktiv setzen
+	return;
+}
 
 // CRC 16
 uint16_t crc16(uint8_t *x, uint8_t lentgh){
