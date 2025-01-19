@@ -1,3 +1,3 @@
-# Sensorboard
-Reads my Home Gasmeter and Powermeter at home
+# Strom Gas Usb Board-firmware
+Reads my Gasmeter and Powermeter at home
  
